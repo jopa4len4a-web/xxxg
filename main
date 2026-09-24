@@ -1,0 +1,724 @@
+import os
+import asyncio
+import json
+import logging
+from datetime import datetime, timedelta
+
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.exceptions import TelegramBadRequest
+
+from telethon import TelegramClient, functions, types as tl_types, utils
+from telethon.sessions import StringSession
+from telethon.errors import (
+    SessionPasswordNeededError, FloodWaitError, UserAlreadyParticipantError,
+    ChannelsTooMuchError, ChannelPrivateError, UsernameInvalidError,
+    UsernameOccupiedError, UserPrivacyRestrictedError, UserNotMutualContactError,
+    UserChannelsTooMuchError, ChatAdminRequiredError, UserAlreadyParticipantError,
+    PeerFloodError, InputUserDeactivatedError,
+)
+from telethon.tl.functions.channels import (
+    JoinChannelRequest, GetParticipantRequest,
+    InviteToChannelRequest, GetParticipantsRequest,
+)
+from telethon.tl.functions.messages import (
+    ImportChatInviteRequest, AddChatUserRequest, GetDialogsRequest,
+)
+from telethon.tl.functions.account import UpdateProfileRequest, UpdateUsernameRequest
+from telethon.tl.functions.photos import UploadProfilePhotoRequest, DeletePhotosRequest, GetUserPhotosRequest
+from telethon.tl.functions.contacts import AddContactRequest, GetContactsRequest
+from telethon.tl.types import ChannelParticipantsSearch, InputPeerChannel, InputPeerChat, InputPeerUser
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.jobstores.base import JobLookupError
+
+import aiosqlite
+
+# ---------- API ----------
+API_ID = 2040
+API_HASH = "b18441a1ff607e10a989891a5462e627"
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN не задан")
+
+DB_PATH = os.getenv("DB_PATH", "bot_data.db")
+logging.basicConfig(level=logging.INFO)
+
+# ---------- ПАРАМЕТРЫ ИНВАЙТА ----------
+INVITE_BATCH = 20             # сколько инвайтов за один батч
+INVITE_BATCH_SECONDS = 30     # за сколько секунд (20 за 30 сек)
+INVITE_PER_BATCH_DELAY = INVITE_BATCH_SECONDS / INVITE_BATCH  # ~1.5 сек между инвайтами
+DEFAULT_INVITE_LIMIT_PER_DAY = 200  # защитный лимит в сутки на аккаунт
+DEFAULT_PARSE_LIMIT = 500           # сколько юзеров парсить из одного источника
+
+# ---------- БАЗА ----------
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                partner_id INTEGER,
+                invite_limit_per_day INTEGER DEFAULT 200,
+                parse_limit INTEGER DEFAULT 500,
+                min_delay_seconds REAL DEFAULT 1.5
+            )
+        ''')
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                phone TEXT,
+                username TEXT,
+                session_string TEXT,
+                is_active INTEGER DEFAULT 1,
+                invited_count INTEGER DEFAULT 0,
+                parsed_count INTEGER DEFAULT 0,
+                sources TEXT DEFAULT '[]',
+                targets TEXT DEFAULT '[]',
+                FOREIGN KEY(user_id) REFERENCES users(user_id)
+            )
+        ''')
+        # очередь распарсенных юзеров на инвайт
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                source_account_id INTEGER,
+                target_account_id INTEGER,
+                target_chat_id INTEGER,
+                target_chat_title TEXT,
+                target_chat_type TEXT,   -- 'channel' или 'chat'
+                target_chat_access_hash INTEGER,
+                user_telegram_id INTEGER,
+                user_username TEXT,
+                user_first_name TEXT,
+                user_last_name TEXT,
+                user_access_hash INTEGER,
+                status TEXT DEFAULT 'pending', -- pending / invited / skipped / failed
+                error TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        # уже приглашённые (глобально)
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS invited (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                target_chat_id INTEGER,
+                user_telegram_id INTEGER,
+                invited_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, target_chat_id, user_telegram_id)
+            )
+        ''')
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS scheduler_jobs (
+                user_id INTEGER PRIMARY KEY,
+                job_id TEXT
+            )
+        ''')
+        # миграции
+        cursor = await db.execute("PRAGMA table_info(users)")
+        cols = {r[1] for r in await cursor.fetchall()}
+        for col, sql in [
+            ("partner_id", "ALTER TABLE users ADD COLUMN partner_id INTEGER"),
+            ("username", "ALTER TABLE users ADD COLUMN username TEXT"),
+            ("invite_limit_per_day", "ALTER TABLE users ADD COLUMN invite_limit_per_day INTEGER DEFAULT 200"),
+            ("parse_limit", "ALTER TABLE users ADD COLUMN parse_limit INTEGER DEFAULT 500"),
+            ("min_delay_seconds", "ALTER TABLE users ADD COLUMN min_delay_seconds REAL DEFAULT 1.5"),
+        ]:
+            if col not in cols:
+                await db.execute(sql)
+
+        cursor = await db.execute("PRAGMA table_info(accounts)")
+        cols = {r[1] for r in await cursor.fetchall()}
+        for col, sql in [
+            ("invited_count", "ALTER TABLE accounts ADD COLUMN invited_count INTEGER DEFAULT 0"),
+            ("parsed_count", "ALTER TABLE accounts ADD COLUMN parsed_count INTEGER DEFAULT 0"),
+            ("sources", "ALTER TABLE accounts ADD COLUMN sources TEXT DEFAULT '[]'"),
+            ("targets", "ALTER TABLE accounts ADD COLUMN targets TEXT DEFAULT '[]'"),
+        ]:
+            if col not in cols:
+                await db.execute(sql)
+        await db.commit()
+
+# ---------- CRUD ----------
+async def ensure_user(user_id: int, username: str = None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+        if not row:
+            await db.execute(
+                "INSERT INTO users (user_id, username, invite_limit_per_day, parse_limit) VALUES (?, ?, ?, ?)",
+                (user_id, username, DEFAULT_INVITE_LIMIT_PER_DAY, DEFAULT_PARSE_LIMIT)
+            )
+        elif username:
+            await db.execute("UPDATE users SET username = ? WHERE user_id = ?", (username, user_id))
+        await db.commit()
+
+async def find_user_by_username(username: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT user_id FROM users WHERE LOWER(username) = LOWER(?)", (username,))
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+async def get_partner_id(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT partner_id FROM users WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+async def set_partner(user_id: int, partner_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET partner_id = ? WHERE user_id = ?", (partner_id, user_id))
+        await db.execute("UPDATE users SET partner_id = ? WHERE user_id = ?", (user_id, partner_id))
+        await db.commit()
+
+async def unset_partner(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT partner_id FROM users WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+        partner_id = row[0] if row else None
+        await db.execute("UPDATE users SET partner_id = NULL WHERE user_id = ?", (user_id,))
+        if partner_id:
+            await db.execute("UPDATE users SET partner_id = NULL WHERE user_id = ?", (partner_id,))
+        await db.commit()
+        return partner_id
+
+async def get_user_settings(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT invite_limit_per_day, parse_limit, min_delay_seconds FROM users WHERE user_id = ?",
+            (user_id,)
+        )
+        row = await cursor.fetchone()
+        if row:
+            return {"invite_limit_per_day": row[0], "parse_limit": row[1], "min_delay_seconds": row[2]}
+        return {"invite_limit_per_day": DEFAULT_INVITE_LIMIT_PER_DAY,
+                "parse_limit": DEFAULT_PARSE_LIMIT, "min_delay_seconds": INVITE_PER_BATCH_DELAY}
+
+async def update_user_setting(user_id: int, key: str, value):
+    allowed = {"invite_limit_per_day", "parse_limit", "min_delay_seconds"}
+    if key not in allowed:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(f"UPDATE users SET {key} = ? WHERE user_id = ?", (value, user_id))
+        await db.commit()
+
+async def get_accounts(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, phone, username, session_string, is_active, invited_count, parsed_count, sources, targets FROM accounts WHERE user_id = ?",
+            (user_id,)
+        )
+        rows = await cursor.fetchall()
+        return [{"id": r[0], "phone": r[1], "username": r[2], "session_string": r[3],
+                 "is_active": bool(r[4]), "invited_count": r[5], "parsed_count": r[6],
+                 "sources": json.loads(r[7] or "[]"), "targets": json.loads(r[8] or "[]")} for r in rows]
+
+async def get_account_by_id(account_id: int, user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, phone, username, session_string, is_active, invited_count, parsed_count, sources, targets FROM accounts WHERE id = ? AND user_id = ?",
+            (account_id, user_id)
+        )
+        row = await cursor.fetchone()
+        if row:
+            return {"id": row[0], "phone": row[1], "username": row[2], "session_string": row[3],
+                    "is_active": bool(row[4]), "invited_count": row[5], "parsed_count": row[6],
+                    "sources": json.loads(row[7] or "[]"), "targets": json.loads(row[8] or "[]")}
+        return None
+
+async def add_account(user_id: int, phone: str, username: str, session_string: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO accounts (user_id, phone, username, session_string) VALUES (?, ?, ?, ?)",
+            (user_id, phone, username, session_string)
+        )
+        await db.commit()
+    partner_id = await get_partner_id(user_id)
+    if partner_id:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT id FROM accounts WHERE user_id = ? AND phone = ?", (partner_id, phone))
+            if not await cursor.fetchone():
+                await db.execute(
+                    "INSERT INTO accounts (user_id, phone, username, session_string) VALUES (?, ?, ?, ?)",
+                    (partner_id, phone, username, session_string)
+                )
+                await db.commit()
+
+async def toggle_account_active(account_id: int, user_id: int, active: bool):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE accounts SET is_active = ? WHERE id = ? AND user_id = ?",
+                         (1 if active else 0, account_id, user_id))
+        await db.commit()
+
+async def update_account_sources(account_id: int, user_id: int, sources: list):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE accounts SET sources = ? WHERE id = ? AND user_id = ?",
+                         (json.dumps(sources), account_id, user_id))
+        await db.commit()
+
+async def update_account_targets(account_id: int, user_id: int, targets: list):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE accounts SET targets = ? WHERE id = ? AND user_id = ?",
+                         (json.dumps(targets), account_id, user_id))
+        await db.commit()
+
+async def update_account_username(account_id: int, user_id: int, username: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE accounts SET username = ? WHERE id = ? AND user_id = ?",
+                         (username, account_id, user_id))
+        await db.commit()
+
+async def increment_account_invited(account_id: int, user_id: int, delta: int = 1):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE accounts SET invited_count = invited_count + ? WHERE id = ? AND user_id = ?",
+                         (delta, account_id, user_id))
+        await db.commit()
+
+async def increment_account_parsed(account_id: int, user_id: int, delta: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE accounts SET parsed_count = parsed_count + ? WHERE id = ? AND user_id = ?",
+                         (delta, account_id, user_id))
+        await db.commit()
+
+# ---------- ОЧЕРЕДЬ ----------
+async def enqueue_user(user_id: int, source_account_id: int, target_account_id: int,
+                       target_chat_id: int, target_chat_title: str, target_chat_type: str,
+                       target_chat_access_hash: int, user_id_tg: int, username: str,
+                       first_name: str, last_name: str, access_hash: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        # уже приглашён?
+        cursor = await db.execute(
+            "SELECT 1 FROM invited WHERE user_id = ? AND target_chat_id = ? AND user_telegram_id = ?",
+            (user_id, target_chat_id, user_id_tg)
+        )
+        if await cursor.fetchone():
+            return False
+        # уже в очереди?
+        cursor = await db.execute(
+            "SELECT 1 FROM queue WHERE user_id = ? AND target_chat_id = ? AND user_telegram_id = ? AND status = 'pending'",
+            (user_id, target_chat_id, user_id_tg)
+        )
+        if await cursor.fetchone():
+            return False
+        await db.execute('''
+            INSERT INTO queue (user_id, source_account_id, target_account_id,
+                target_chat_id, target_chat_title, target_chat_type, target_chat_access_hash,
+                user_telegram_id, user_username, user_first_name, user_last_name, user_access_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (user_id, source_account_id, target_account_id,
+              target_chat_id, target_chat_title, target_chat_type, target_chat_access_hash,
+              user_id_tg, username, first_name, last_name, access_hash))
+        await db.commit()
+        return True
+
+async def pop_queue_batch(user_id: int, limit: int = 20):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, source_account_id, target_account_id, target_chat_id, target_chat_title, target_chat_type, target_chat_access_hash, user_telegram_id, user_username, user_first_name, user_last_name, user_access_hash FROM queue WHERE user_id = ? AND status = 'pending' ORDER BY id LIMIT ?",
+            (user_id, limit)
+        )
+        rows = await cursor.fetchall()
+        return [{"id": r[0], "source_account_id": r[1], "target_account_id": r[2],
+                 "target_chat_id": r[3], "target_chat_title": r[4], "target_chat_type": r[5],
+                 "target_chat_access_hash": r[6], "user_telegram_id": r[7], "user_username": r[8],
+                 "user_first_name": r[9], "user_last_name": r[10], "user_access_hash": r[11]} for r in rows]
+
+async def mark_queue_status(queue_id: int, status: str, error: str = None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE queue SET status = ?, error = ? WHERE id = ?", (status, error, queue_id))
+        await db.commit()
+
+async def mark_invited(user_id: int, target_chat_id: int, user_telegram_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute(
+                "INSERT OR IGNORE INTO invited (user_id, target_chat_id, user_telegram_id) VALUES (?, ?, ?)",
+                (user_id, target_chat_id, user_telegram_id)
+            )
+            await db.commit()
+        except Exception:
+            pass
+
+async def queue_stats(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT status, COUNT(*) FROM queue WHERE user_id = ? GROUP BY status", (user_id,)
+        )
+        rows = await cursor.fetchall()
+        return {r[0]: r[1] for r in rows}
+
+# ---------- КЛАВИАТУРЫ ----------
+async def get_main_keyboard(user_id: int):
+    is_running = False
+    job_id = await get_job_id(user_id)
+    if job_id:
+        try:
+            scheduler.get_job(job_id)
+            is_running = True
+        except JobLookupError:
+            is_running = False
+    btn = "⏹ Остановить рассылку" if is_running else "▶️ Запустить рассылку"
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📋 Аккаунты")],
+            [KeyboardButton(text="🤝 Партнёрство")],
+            [KeyboardButton(text="⚙️ Настройки")],
+            [KeyboardButton(text=btn)]
+        ],
+        resize_keyboard=True
+    )
+
+def accounts_keyboard(accounts):
+    kb = []
+    for acc in accounts:
+        status = "✅" if acc['is_active'] else "❌"
+        username = acc['username'] if acc['username'] else "без ника"
+        display = f"{status} @{username} • {acc['phone']} • 📥{len(acc['sources'])} 📤{len(acc['targets'])}"
+        kb.append([KeyboardButton(text=display)])
+    kb.append([KeyboardButton(text="➕ Добавить аккаунт")])
+    kb.append([KeyboardButton(text="🔙 Назад")])
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+def account_detail_keyboard(account_id: int, is_active: bool):
+    toggle_text = "🔄 Выключить" if is_active else "🔄 Включить"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=toggle_text, callback_data=f"acc_toggle_{account_id}")],
+        [InlineKeyboardButton(text="📥 Источники", callback_data=f"acc_sources_{account_id}"),
+         InlineKeyboardButton(text="📤 Цели", callback_data=f"acc_targets_{account_id}")],
+        [InlineKeyboardButton(text="✏️ Настройки профиля", callback_data=f"acc_profile_{account_id}")],
+        [InlineKeyboardButton(text="🔙 Назад к списку", callback_data="back_to_accounts")]
+    ])
+
+def profile_edit_keyboard(account_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👤 Имя", callback_data=f"prof_first_{account_id}"),
+         InlineKeyboardButton(text="📛 Фамилия", callback_data=f"prof_last_{account_id}")],
+        [InlineKeyboardButton(text="🔗 Юзернейм", callback_data=f"prof_user_{account_id}"),
+         InlineKeyboardButton(text="🖼 Аватар", callback_data=f"prof_avatar_{account_id}")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data=f"acc_back_{account_id}")]
+    ])
+
+def sources_keyboard(account_id: int, sources: list):
+    kb = []
+    for i, src in enumerate(sources):
+        title = src.get('title', str(src.get('id')))
+        kb.append([InlineKeyboardButton(text=f"❌ {title}", callback_data=f"src_del_{account_id}_{i}")])
+    kb.append([InlineKeyboardButton(text="📋 Выбрать из чатов", callback_data=f"src_pick_{account_id}")])
+    kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"acc_back_{account_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def targets_keyboard(account_id: int, targets: list):
+    kb = []
+    for i, tgt in enumerate(targets):
+        title = tgt.get('title', str(tgt.get('id')))
+        kb.append([InlineKeyboardButton(text=f"❌ {title}", callback_data=f"tgt_del_{account_id}_{i}")])
+    kb.append([InlineKeyboardButton(text="📋 Выбрать из чатов", callback_data=f"tgt_pick_{account_id}")])
+    kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"acc_back_{account_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def dialogs_picker_keyboard(account_id: int, dialogs: list, kind: str):
+    """kind = 'src' или 'tgt'"""
+    kb = []
+    for i, d in enumerate(dialogs):
+        title = d['title'][:40]
+        kb.append([InlineKeyboardButton(
+            text=f"{title}",
+            callback_data=f"{kind}_add_{account_id}_{i}"
+        )])
+    kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"acc_back_{account_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def partnership_main_keyboard(has_partner: bool):
+    kb = []
+    if has_partner:
+        kb.append([InlineKeyboardButton(text="❌ Расторгнуть партнёрство", callback_data="partner_main_unset")])
+    else:
+        kb.append([InlineKeyboardButton(text="➕ Привязать партнёра", callback_data="partner_main_link")])
+    kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def settings_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Статистика очереди", callback_data="settings_stats")],
+        [InlineKeyboardButton(text="⏱ Лимит инвайтов в день", callback_data="settings_invite_limit")],
+        [InlineKeyboardButton(text="📥 Лимит парсинга", callback_data="settings_parse_limit")],
+        [InlineKeyboardButton(text="⏸ Мин. задержка между инвайтами (сек)", callback_data="settings_min_delay")],
+        [InlineKeyboardButton(text="🧹 Очистить очередь", callback_data="settings_clear_queue")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="settings_back")]
+    ])
+
+# ---------- FSM ----------
+class AddAccountStates(StatesGroup):
+    waiting_phone = State()
+    waiting_code = State()
+    waiting_password = State()
+
+class PartnershipStates(StatesGroup):
+    waiting_username = State()
+
+class ProfileEditStates(StatesGroup):
+    waiting_first_name = State()
+    waiting_last_name = State()
+    waiting_username = State()
+    waiting_avatar = State()
+
+class SettingsStates(StatesGroup):
+    waiting_invite_limit = State()
+    waiting_parse_limit = State()
+    waiting_min_delay = State()
+
+# ---------- ПЛАНИРОВЩИК ----------
+scheduler = AsyncIOScheduler()
+
+async def save_job_id(user_id: int, job_id: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR REPLACE INTO scheduler_jobs (user_id, job_id) VALUES (?, ?)", (user_id, job_id))
+        await db.commit()
+
+async def get_job_id(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT job_id FROM scheduler_jobs WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+async def delete_job_id(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM scheduler_jobs WHERE user_id = ?", (user_id,))
+        await db.commit()
+
+# ---------- ПАРСИНГ УЧАСТНИКОВ ----------
+async def parse_source_chat(client, source: dict, parse_limit: int):
+    """
+    Возвращает список словарей {id, username, first_name, last_name, access_hash}
+    только с username, без ботов.
+    """
+    try:
+        entity = await client.get_entity(source['id'])
+    except Exception:
+        try:
+            entity = await client.get_entity(source.get('username'))
+        except Exception as e:
+            logging.error(f"Источник {source.get('title')}: {e}")
+            return []
+
+    result = []
+    offset = 0
+    step = 200
+    while len(result) < parse_limit:
+        try:
+            participants = await client(functions.channels.GetParticipantsRequest(
+                channel=entity,
+                filter=ChannelParticipantsSearch(''),
+                offset=offset, limit=step, hash=0
+            )) if isinstance(entity, tl_types.Channel) else None
+        except Exception:
+            participants = None
+
+        try:
+            if participants is None:
+                participants = await client(functions.messages.GetParticipantsRequest(
+                    peer=entity, filter=ChannelParticipantsSearch(''),
+                    offset=offset, limit=step, hash=0
+                ))
+        except Exception as e:
+            logging.warning(f"GetParticipants {source.get('title')}: {e}")
+            break
+
+        if not participants or not participants.users:
+            break
+
+        for u in participants.users:
+            if u.bot:
+                continue
+            if not getattr(u, 'username', None):
+                continue
+            result.append({
+                'id': u.id,
+                'username': u.username,
+                'first_name': u.first_name or '',
+                'last_name': u.last_name or '',
+                'access_hash': u.access_hash,
+            })
+            if len(result) >= parse_limit:
+                break
+        offset += step
+        if len(participants.users) < step:
+            break
+    return result
+
+# ---------- ИНВАЙТ ЧЕРЕЗ КОНТАКТ ----------
+async def invite_user_via_contact(client, target: dict, u: dict):
+    """
+    1. Добавляет юзера в контакты.
+    2. Инвайтит в целевой чат/канал.
+    Возвращает (ok, reason).
+    """
+    try:
+        # 1. Добавляем контакт
+        await client(AddContactRequest(
+            id=InputPeerUser(u['id'], u['access_hash']),
+            first_name=u.get('first_name') or u.get('username') or 'User',
+            last_name=u.get('last_name') or '',
+            phone='',
+            add_phone_privacy_exception=False
+        ))
+    except FloodWaitError as e:
+        await asyncio.sleep(e.seconds)
+        return False, f"flood_wait_contact_{e.seconds}s"
+    except UserPrivacyRestrictedError:
+        return False, "privacy_restricted"
+    except Exception as e:
+        logging.warning(f"AddContact: {e}")
+        # не критично — может быть уже в контактах
+
+    # 2. Инвайт
+    try:
+        if target['type'] == 'channel':
+            await client(InviteToChannelRequest(
+                channel=InputPeerChannel(target['id'], target['access_hash']),
+                users=[InputPeerUser(u['id'], u['access_hash'])]
+            ))
+        else:
+            await client(AddChatUserRequest(
+                chat_id=target['id'],
+                user_id=InputPeerUser(u['id'], u['access_hash']),
+                fwd_limit=100
+            ))
+        return True, "invited"
+    except UserAlreadyParticipantError:
+        return False, "already_participant"
+    except UserNotMutualContactError:
+        return False, "not_mutual_contact"
+    except UserChannelsTooMuchError:
+        return False, "target_channels_too_much"
+    except ChatAdminRequiredError:
+        return False, "no_admin_rights"
+    except PeerFloodError:
+        return False, "peer_flood"
+    except FloodWaitError as e:
+        await asyncio.sleep(e.seconds)
+        return False, f"flood_wait_invite_{e.seconds}s"
+    except Exception as e:
+        return False, f"error: {type(e).__name__}: {e}"
+
+# ---------- ГЛАВНЫЙ ПРОЦЕСС (ПАРСИНГ + ИНВАЙТ) ----------
+async def process_user(user_id: int):
+    """Один проход: парсит источники активных аккаунтов, наполняет очередь, инвайтит батчами."""
+    settings = await get_user_settings(user_id)
+    accounts = await get_accounts(user_id)
+    active = [a for a in accounts if a['is_active']]
+    if not active:
+        return
+
+    # 1) ПАРСИНГ (с каждого аккаунта его источники)
+    for acc in active:
+        if not acc['sources'] or not acc['targets']:
+            continue
+        client = TelegramClient(StringSession(acc['session_string']), API_ID, API_HASH)
+        try:
+            await client.start()
+            total_parsed = 0
+            for src in acc['sources']:
+                users = await parse_source_chat(client, src, settings['parse_limit'])
+                if not users:
+                    continue
+                # записываем в очередь для каждой цели этого аккаунта
+                for tgt in acc['targets']:
+                    for u in users:
+                        # исключаем тех, кто уже в целевом чате
+                        if await is_user_in_chat(client, tgt, u['id']):
+                            continue
+                        await enqueue_user(
+                            user_id, acc['id'], acc['id'],
+                            tgt['id'], tgt.get('title', ''), tgt.get('type', 'channel'),
+                            tgt.get('access_hash', 0),
+                            u['id'], u['username'], u['first_name'], u['last_name'], u['access_hash']
+                        )
+                        total_parsed += 1
+            if total_parsed:
+                await increment_account_parsed(acc['id'], user_id, total_parsed)
+        except Exception as e:
+            logging.error(f"Парсинг [{acc['phone']}]: {e}")
+        finally:
+            await client.disconnect()
+
+    # 2) ИНВАЙТ (батчами по 20 за 30 секунд)
+    batch = await pop_queue_batch(user_id, INVITE_BATCH)
+    if not batch:
+        return
+
+    # группируем по целевому аккаунту
+    by_account = {}
+    for item in batch:
+        by_account.setdefault(item['target_account_id'], []).append(item)
+
+    for account_id, items in by_account.items():
+        acc = next((a for a in active if a['id'] == account_id), None)
+        if not acc:
+            for it in items:
+                await mark_queue_status(it['id'], 'skipped', 'account_inactive')
+            continue
+
+        # защитный лимит в сутки
+        if acc['invited_count'] >= settings['invite_limit_per_day']:
+            for it in items:
+                await mark_queue_status(it['id'], 'skipped', 'daily_limit')
+            continue
+
+        client = TelegramClient(StringSession(acc['session_string']), API_ID, API_HASH)
+        try:
+            await client.start()
+            for it in items:
+                if acc['invited_count'] >= settings['invite_limit_per_day']:
+                    await mark_queue_status(it['id'], 'skipped', 'daily_limit')
+                    continue
+                target = {
+                    'id': it['target_chat_id'],
+                    'type': it['target_chat_type'],
+                    'access_hash': it['target_chat_access_hash'],
+                }
+                u = {
+                    'id': it['user_telegram_id'],
+                    'username': it['user_username'],
+                    'first_name': it['user_first_name'],
+                    'last_name': it['user_last_name'],
+                    'access_hash': it['user_access_hash'],
+                }
+                ok, reason = await invite_user_via_contact(client, target, u)
+                if ok:
+                    await mark_queue_status(it['id'], 'invited')
+                    await mark_invited(user_id, it['target_chat_id'], it['user_telegram_id'])
+                    await increment_account_invited(account_id, user_id, 1)
+                    acc['invited_count'] += 1
+                else:
+                    if reason in ("already_participant", "not_mutual_contact",
+                                  "target_channels_too_much", "privacy_restricted",
+                                  "no_admin_rights", "peer_flood"):
+                        await mark_queue_status(it['id'], 'skipped', reason)
+                        await mark_invited(user_id, it['target_chat_id'], it['user_telegram_id'])
+                    else:
+                        await mark_queue_status(it['id'], 'failed', reason)
+                await asyncio.sleep(settings['min_delay_seconds'])
+        except Exception as e:
+            logging.error(f"Инвайт [{acc['phone']}]: {e}")
+            for it in items:
+                await mark_queue_status(it['id'], 'failed', str(e))
+        finally:
+            await client.disconnect()
+
+async def is_user_in_chat(client, target: dict, user_id_tg: int):
+    try:
+        entity = await client.get_entity(target['id'])
+        await client(functions.channels.GetParticipantRequest(channel=entity, participant=user_id_tg))
+        return True
+    except Exception:
+        return False
+
+# ----------
